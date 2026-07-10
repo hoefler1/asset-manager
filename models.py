@@ -326,6 +326,198 @@ class Holding:
         return [Holding.from_dict(h) for h in data if isinstance(h, dict)]
 
 
+def _to_number(value: Any) -> Optional[float]:
+    """Wandelt einen Wert in ``float`` um.
+
+    Parqet liefert Geldbeträge teils als reine Zahl, teils als verschachteltes
+    Objekt (z. B. ``{"amount": 123.4, "currency": "EUR"}``). Diese Hilfe deckt
+    beide Fälle ab und gibt ``None`` zurück, wenn nichts Sinnvolles gefunden
+    wird.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.replace(",", "."))
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        for key in ("amount", "value", "eur", "gross", "net", "total"):
+            if key in value:
+                nested = _to_number(value[key])
+                if nested is not None:
+                    return nested
+    return None
+
+
+@dataclass
+class PerformanceAsset:
+    """Das ``asset``-Objekt eines Holdings in der Performance-Antwort.
+
+    Achtung: hier steckt nur ``type`` (``security`` / ``crypto``), ``symbol``
+    und ``name`` – der Wertpapier-Untertyp (Aktie vs. ETF) ist nicht enthalten
+    und muss anderweitig (z. B. über den Namen) bestimmt werden.
+    """
+
+    type: Optional[str] = None
+    symbol: Optional[str] = None
+    name: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PerformanceAsset":
+        return cls(
+            type=data.get("type"),
+            symbol=data.get("symbol"),
+            name=data.get("name"),
+        )
+
+
+@dataclass
+class UnrealizedGains:
+    """``performance.unrealizedGains`` – die nicht realisierten Gewinne/Verluste.
+
+    Parqet verschachtelt die Werte unter ``inInterval``. ``gainGross`` ist der
+    reine Kursgewinn, ``gainNet`` zusätzlich um Gebühren bereinigt.
+    """
+
+    gainGross: Optional[float] = None
+    gainNet: Optional[float] = None
+    returnGross: Optional[float] = None
+    returnNet: Optional[float] = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "UnrealizedGains":
+        # Werte liegen unter ``inInterval``; fällt darauf zurück, die Werte
+        # direkt zu lesen, falls die Struktur einmal flacher sein sollte.
+        inner = data.get("inInterval") if isinstance(data, dict) else None
+        if not isinstance(inner, dict):
+            inner = data if isinstance(data, dict) else {}
+        return cls(
+            gainGross=_to_number(inner.get("gainGross")),
+            gainNet=_to_number(inner.get("gainNet")),
+            returnGross=_to_number(inner.get("returnGross")),
+            returnNet=_to_number(inner.get("returnNet")),
+        )
+
+
+@dataclass
+class HoldingPosition:
+    """Das ``position``-Objekt eines Holdings (Stückzahl, Werte, isSold)."""
+
+    shares: Optional[float] = None
+    purchasePrice: Optional[float] = None
+    purchaseValue: Optional[float] = None
+    currentPrice: Optional[float] = None
+    currentValue: Optional[float] = None
+    isSold: Optional[bool] = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "HoldingPosition":
+        return cls(
+            shares=_to_number(data.get("shares")),
+            purchasePrice=_to_number(data.get("purchasePrice")),
+            purchaseValue=_to_number(data.get("purchaseValue")),
+            currentPrice=_to_number(data.get("currentPrice")),
+            currentValue=_to_number(data.get("currentValue")),
+            isSold=data.get("isSold"),
+        )
+
+
+@dataclass
+class PerformanceHolding:
+    """Ein Holding aus der ``POST /performance`` Antwort von Parqet."""
+
+    id: Optional[str] = None
+    activityCount: Optional[int] = None
+    asset: Optional[PerformanceAsset] = None
+    unrealizedGains: Optional[UnrealizedGains] = None
+    position: Optional[HoldingPosition] = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PerformanceHolding":
+        asset = data.get("asset")
+        perf = data.get("performance")
+        ug = perf.get("unrealizedGains") if isinstance(perf, dict) else None
+        # Fallback, falls unrealizedGains einmal direkt am Holding liegt.
+        if ug is None:
+            ug = data.get("unrealizedGains")
+        pos = data.get("position")
+        return cls(
+            id=data.get("id") or data.get("_id"),
+            activityCount=data.get("activityCount"),
+            asset=PerformanceAsset.from_dict(asset) if isinstance(asset, dict) else None,
+            unrealizedGains=(
+                UnrealizedGains.from_dict(ug) if isinstance(ug, dict) else None
+            ),
+            position=HoldingPosition.from_dict(pos) if isinstance(pos, dict) else None,
+        )
+
+    def gain(self, use_net: bool = False) -> float:
+        """Nicht realisierter Gewinn/Verlust (0.0 falls unbekannt).
+
+        ``use_net`` wählt ``gainNet`` (nach Gebühren) statt ``gainGross``.
+        """
+        if self.unrealizedGains is None:
+            return 0.0
+        value = self.unrealizedGains.gainNet if use_net else self.unrealizedGains.gainGross
+        if value is None:
+            # Falls die gewünschte Variante fehlt, die andere versuchen.
+            value = self.unrealizedGains.gainGross if use_net else self.unrealizedGains.gainNet
+        return value if value is not None else 0.0
+
+    @property
+    def identifier(self) -> Optional[str]:
+        if self.id:
+            return self.id
+        return self.asset.symbol if self.asset else None
+
+    @property
+    def asset_type(self) -> Optional[str]:
+        return self.asset.type if self.asset else None
+
+    @property
+    def is_sold(self) -> bool:
+        return bool(self.position.isSold) if self.position else False
+
+    @property
+    def name(self) -> str:
+        if self.asset is not None and self.asset.name:
+            return self.asset.name
+        return self.identifier or "Unbekannt"
+
+
+@dataclass
+class PerformanceResponse:
+    """Antwort des Parqet-Endpunkts ``POST /performance``.
+
+    Interessant ist die Liste der ``holdings`` mit ihren ``unrealizedGains``.
+    Die Wurzel wird tolerant behandelt: sie darf direkt eine Liste sein oder die
+    Holdings unter ``holdings``/``positions`` führen.
+    """
+
+    holdings: list[PerformanceHolding] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "PerformanceResponse":
+        if isinstance(data, list):
+            raw_holdings: list[Any] = data
+        elif isinstance(data, dict):
+            raw_holdings = data.get("holdings") or data.get("positions") or []
+        else:
+            raw_holdings = []
+        return cls(
+            holdings=[
+                PerformanceHolding.from_dict(h)
+                for h in raw_holdings
+                if isinstance(h, dict)
+            ]
+        )
+
+
 @dataclass
 class ActivitiesResponse:
     interval: Optional[Interval] = None
